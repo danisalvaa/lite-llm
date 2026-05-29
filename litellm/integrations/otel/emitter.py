@@ -134,6 +134,27 @@ class SpanEmitter:
             start_time_ns=start_time_ns,
             tracer=tracer,
         )
+        self.finish_span(role, span, data, end_time_ns=end_time_ns)
+        return span
+
+    def finish_span(
+        self,
+        role: SpanRole,
+        span: Span,
+        data: SpanData,
+        *,
+        end_time_ns: int | None = None,
+    ) -> None:
+        """Stamp attributes + status on an already-started ``span`` and end it.
+
+        The counterpart to :meth:`start_span` for callers that own a span's
+        lifecycle — the LLM-call span is opened at the request's ``pre_call``
+        boundary (so it parents to the live server span via real ambient context,
+        never a span threaded through a metadata dict) and closed here once the
+        typed payload is available. The span name is (re)built from the now-known
+        data, since the boundary opener only has a provisional name.
+        """
+        span.update_name(_NAME_BUILDERS[role](data))
         for mapper in self._mappers:
             for key, value in mapper.map(data).items():
                 span.set_attribute(key, value)
@@ -152,4 +173,3 @@ class SpanEmitter:
         # span-level health signal litellm doesn't actually evaluate. Only a
         # genuine error sets a status.
         span.end(end_time=end_time_ns)
-        return span

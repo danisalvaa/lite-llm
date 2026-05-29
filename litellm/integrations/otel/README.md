@@ -92,19 +92,26 @@ becomes the global, so server spans export to that backend too.
    server spans and gen-ai spans share one provider and the same trace.
 3. **Request**: the FastAPI instrumentation starts the server span and makes it
    the active context for the request task.
-4. **LLM call logging**: LiteLLM's async logging worker copies the request's
-   context when it enqueues the success/failure callback, so
-   `OpenTelemetryV2.async_log_success_event` runs with the server span as the
-   ambient parent. It builds an `LLMCallSpanData` from the request's
-   `standard_logging_object` and hands it to the engine, which creates the LLM
-   span as a child of the server span. Emission is **async-only**; the
-   synchronous callback runs in a worker thread without the request context and
-   is a no-op. **Pass-through** endpoints dispatch their logging from a detached
-   `asyncio.create_task` whose copied context may no longer carry the server
-   span, so the proxy also threads the span explicitly as
-   `litellm_parent_otel_span`; the adapter falls back to it when the ambient
-   context has no recordable span, so the pass-through LLM-call span still nests
-   under the request instead of becoming its own root trace.
+4. **LLM call span (born at the boundary)**: `OpenTelemetryV2.log_pre_api_call`
+   runs synchronously in the request task, just before the upstream call — the
+   one point where the FastAPI server span is genuinely the ambient OTel context
+   — and **opens** the LLM-call span there, parented to that server span via real
+   ambient context. The open span is stashed on the per-request
+   `LiteLLMLoggingObj` (a typed object), so no live `Span` ever travels through a
+   `litellm_params` metadata dict. The async success/failure callback later
+   **closes** it: it builds an `LLMCallSpanData` from the typed
+   `standard_logging_object` (token usage and cost are computed only by then),
+   stamps the attributes, sets status, and ends the span. The sync callback is a
+   no-op (closing is async-only). When `pre_call` runs off the request task — a
+   sync-only provider driven through a thread pool, where contextvars don't
+   follow — no ambient parent is visible, so creation is **deferred** to the async
+   callback, whose worker context was copied from the request task at enqueue and
+   so still carries the server span. **Pass-through** endpoints call
+   `logging_obj.pre_call` in the request task too, so their LLM-call span is
+   opened at the boundary and parents natively — no `litellm_parent_otel_span`
+   threading. Because the span only exists if `pre_call` ran, a request rejected
+   at the auth/budget gate or blocked by a pre-call guardrail never produces a
+   phantom CLIENT span — no post-hoc heuristics required.
 5. **Guardrails / services**: the post-call and service hooks emit guardrail and
    service spans the same way — typed data → engine → span. Service spans
    (Redis/Postgres) are dispatched by `litellm/_service_logger.py`, which
@@ -183,7 +190,10 @@ be imported anywhere:
 
 - [`logger.py`](./logger.py) — `OpenTelemetryV2`, a `CustomLogger` that
   translates LiteLLM's logging callbacks into typed span data and hands them to
-  the engine.
+  the engine. The LLM-call span is opened at the `log_pre_api_call` boundary
+  (parented to the live server span via ambient context) and closed at the async
+  success/failure callback; the open span lives on the per-request
+  `LiteLLMLoggingObj`, never in a metadata dict.
 
 ### Presets
 

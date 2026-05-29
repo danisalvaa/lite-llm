@@ -2,9 +2,9 @@
 
 1. Baggage allowlists are configurable via env vars and config.yaml
    (``callback_settings.otel.*``), not just hard-coded.
-2. Pass-through LLM-call spans nest under the proxy server span via the
-   explicitly threaded ``litellm_parent_otel_span`` when the ambient context
-   has lost it.
+2. Pass-through LLM-call spans nest under the proxy server span because they are
+   opened at the ``pre_call`` boundary in the request task (where the server span
+   is ambient) — no span threaded through metadata.
 4. Guardrail span data is built from the typed
    ``StandardLoggingGuardrailInformation`` shape (provider-agnostic), not from
    one provider's assumed field names.
@@ -91,8 +91,12 @@ def test_baggage_processor_allowlist_uses_config_keys():
 
 
 # --------------------------------------------------------------------------- #
-#  Problem 2 — pass-through LLM span parents to the threaded server span
+#  Problem 2 — pass-through LLM span parents to the ambient server span
 # --------------------------------------------------------------------------- #
+
+
+class _LoggingObj:
+    """Per-request attribute carrier, like ``LiteLLMLoggingObj``."""
 
 
 def _logger():
@@ -117,20 +121,24 @@ def _payload():
     }
 
 
-def test_passthrough_llm_span_uses_threaded_parent_without_ambient_context():
-    """Pass-through logging runs in a detached task with no ambient server span.
-    The LLM-call span must still nest under the ``litellm_parent_otel_span``
-    threaded through metadata instead of becoming a separate root trace."""
+def test_passthrough_llm_span_parents_to_ambient_server_span():
+    """Pass-through calls ``logging_obj.pre_call`` in the request task, where the
+    server span is the ambient context — so the LLM-call span is opened there and
+    parents to it natively, with no ``litellm_parent_otel_span`` threading. The
+    later (possibly detached) success callback only closes the already-parented
+    span, so it never becomes a separate root trace."""
     logger, exporter = _logger()
     server = logger._emitter.start_span(
         SpanRole.PROXY_REQUEST, LITELLM_PROXY_REQUEST_SPAN_NAME
     )
     kwargs = {
         "standard_logging_object": _payload(),
-        # No ambient span active (we do NOT use_span here) — only the explicit
-        # threaded parent, exactly as pass-through threads it.
-        "litellm_params": {"metadata": {"litellm_parent_otel_span": server}},
+        "litellm_params": {"metadata": {}},
+        "litellm_logging_obj": _LoggingObj(),
     }
+    # pre_call runs in the request task (server span ambient); success closes it.
+    with trace.use_span(server, end_on_exit=False):
+        logger.log_pre_api_call(model="gpt-4o", messages=[], kwargs=kwargs)
     asyncio.run(logger.async_log_success_event(kwargs, None, None, None))
     server.end()
 
@@ -140,28 +148,32 @@ def test_passthrough_llm_span_uses_threaded_parent_without_ambient_context():
     assert llm_span.parent.span_id == server.get_span_context().span_id
 
 
-def test_threaded_server_span_wins_for_llm_call():
-    """The LLM call is a request-level span: it parents to the threaded server
-    span (the request root), not whatever span is ambient. This keeps it out of a
-    phase span (e.g. ``auth``) that may be active when failure logging fires —
-    the auth-failure 401 case, where the LLM-call log was nesting under ``auth``."""
+def test_llm_span_unaffected_by_phase_span_active_at_close():
+    """The LLM-call span's parent is captured at the ``pre_call`` boundary (under
+    the server span), so a phase span (e.g. ``auth``) that happens to be ambient
+    when the *close* callback fires can't re-parent it. This is the structural
+    successor to the old auth-failure-401 case where the LLM log nested under
+    ``auth``: the span is now born after auth, parented to the request root."""
     logger, exporter = _logger()
-    # Ambient = an active phase span (auth); request root threaded explicitly.
-    ambient = logger._emitter.start_span(SpanRole.SERVICE, "auth /v1/chat/completions")
-    request_root = logger._emitter.start_span(
+    server = logger._emitter.start_span(
         SpanRole.PROXY_REQUEST, LITELLM_PROXY_REQUEST_SPAN_NAME
     )
     kwargs = {
         "standard_logging_object": _payload(),
-        "litellm_params": {"metadata": {"litellm_parent_otel_span": request_root}},
+        "litellm_params": {"metadata": {}},
+        "litellm_logging_obj": _LoggingObj(),
     }
-    with trace.use_span(ambient, end_on_exit=False):
+    with trace.use_span(server, end_on_exit=False):
+        logger.log_pre_api_call(model="gpt-4o", messages=[], kwargs=kwargs)
+    # A phase span is ambient when the close callback fires — must not re-parent.
+    phase = logger._emitter.start_span(SpanRole.SERVICE, "auth /v1/chat/completions")
+    with trace.use_span(phase, end_on_exit=False):
         asyncio.run(logger.async_log_success_event(kwargs, None, None, None))
-    ambient.end()
-    request_root.end()
+    phase.end()
+    server.end()
     by_name = {s.name: s for s in exporter.get_finished_spans()}
     llm_span = by_name["chat gpt-4o"]
-    assert llm_span.parent.span_id == request_root.get_span_context().span_id
+    assert llm_span.parent.span_id == server.get_span_context().span_id
 
 
 # --------------------------------------------------------------------------- #

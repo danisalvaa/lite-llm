@@ -32,30 +32,22 @@ def context_from_span(span: Span, context: Context | None = None) -> Context:
     return set_span_in_context(span, context=context)
 
 
-def resolve_parent_context(
-    threaded: Span | None = None, *, prefer_threaded: bool = False
-) -> Context:
+def resolve_parent_context(threaded: Span | None = None) -> Context:
     """The context a child span should parent under.
 
-    By default this is ambient-first: parent to the active OTel context (the
-    server span, restored by the logging worker or active in the request task),
-    falling back to the span the proxy threaded explicitly
-    (``litellm_parent_otel_span``) only when the ambient context has no recordable
-    span — e.g. logging dispatched from a detached ``asyncio.create_task``, or a
-    background service call. When neither is recordable the ambient context is
-    returned unchanged, so the span starts a new root trace.
+    Ambient-first: parent to the active OTel context (the server span, restored
+    by the logging worker or active in the request task), falling back to a span
+    passed explicitly (``threaded``) only when the ambient context has no
+    recordable span — e.g. a background service call with no request on the
+    stack. When neither is recordable the ambient context is returned unchanged,
+    so the span starts a new root trace.
 
-    ``prefer_threaded`` flips the precedence: when the threaded span is recordable
-    it wins over ambient. Use this for **request-level** spans (the LLM call, the
-    guardrail) that must hang off the server span regardless of what phase span
-    happens to be active — otherwise a span emitted while the ``auth`` phase span
-    is active (e.g. failure logging) would nest under ``auth`` instead of the
-    request root. Service/DB spans deliberately do *not* set this, so they still
-    nest under whatever phase is active.
+    Only service/DB spans pass ``threaded`` (the ``parent_otel_span`` handed to
+    the service hook). Request-level spans — the LLM call and guardrails — are
+    created where the server span is genuinely ambient, so they never need it.
     """
     ctx = get_current()
-    ambient_ok = is_recordable_span(get_current_span(ctx))
-    if is_recordable_span(threaded) and (prefer_threaded or not ambient_ok):
+    if is_recordable_span(threaded) and not is_recordable_span(get_current_span(ctx)):
         ctx = context_from_span(threaded, context=ctx)  # type: ignore[arg-type]
     return ctx
 
