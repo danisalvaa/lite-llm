@@ -14,9 +14,12 @@ than a ``Span`` threaded through a request-metadata dict. The LLM-call span in
 particular is **born at the call boundary**: ``log_pre_api_call`` opens it while
 the request task is still on the stack (so the live server span is genuinely
 ambient and becomes its parent), and the async success/failure callback closes
-it once the typed ``StandardLoggingPayload`` is available. The open span lives on
-the per-request ``LiteLLMLoggingObj`` — a typed object, not a metadata dict — so
-no live span ever travels through ``litellm_params``.
+it once the typed ``StandardLoggingPayload`` is available. The open span is held
+in a bounded cache keyed by ``litellm_call_id`` (present in the callback kwargs at
+both ``pre_call`` and close) until it is closed — no live span ever travels
+through ``litellm_params``, and the logging object need not be reachable from the
+callback. For the boundary hook to fire, the logger is registered into
+``litellm.input_callback`` (the list ``Logging.pre_call`` iterates).
 
 When ``pre_call`` runs off the request task (a provider with no async support is
 driven through a thread pool, where contextvars don't propagate), no ambient
@@ -30,6 +33,7 @@ pre-call guardrail never reaches ``pre_call``, so no span is opened and the
 failure log can't produce a phantom CLIENT span — no post-hoc heuristics needed.
 """
 
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Iterator, Mapping, cast
@@ -76,22 +80,23 @@ _OTEL_MODULES = (
 )
 
 
-# Attribute on the per-request ``LiteLLMLoggingObj`` that carries the open
-# LLM-call span (or the deferred start time) from ``pre_call`` to the async
-# success/failure callback. The logging object is a typed per-request object, so
-# this never stuffs a live span into a ``litellm_params`` metadata dict.
-_LLM_SPAN_CARRIER_ATTR = "_otel_v2_llm_call"
+# Cap on the open-call carrier map. A span opened at ``pre_call`` that never
+# reaches a success/failure callback (e.g. a stream that only fires stream
+# events) would otherwise linger; bounding the map evicts the oldest so memory
+# stays flat on a long-running proxy while covering every concurrent in-flight
+# call.
+_OPEN_CALLS_MAX = 10_000
 
 
 class _LLMCallSpan:
-    """The state threaded from the ``pre_call`` boundary to span close.
+    """The state carried from the ``pre_call`` boundary to span close.
 
     ``span`` is the live span when it could be opened at the boundary (the server
     span was ambient), or ``None`` when creation was deferred because no ambient
     parent was visible — in which case the async callback creates it against its
     own (worker-copied) ambient context using ``start_time_ns``. The presence of
-    the carrier at all is the proof that ``pre_call`` ran, i.e. that an upstream
-    call was actually attempted.
+    a carrier for a call at all is the proof that ``pre_call`` ran, i.e. that an
+    upstream call was actually attempted.
     """
 
     __slots__ = ("span", "start_time_ns")
@@ -101,14 +106,20 @@ class _LLMCallSpan:
         self.start_time_ns = start_time_ns
 
 
-def _logging_object(kwargs: Mapping[str, Any]) -> Any | None:
-    """The per-request ``LiteLLMLoggingObj`` carried in the logging kwargs.
+def _call_id(kwargs: Mapping[str, Any]) -> str | None:
+    """The ``litellm_call_id`` correlating ``pre_call`` with the close callback.
 
-    ``model_call_details`` (the dict passed to every logging callback) holds a
-    back-reference to the ``LiteLLMLoggingObj`` that owns it, so the same typed
-    object is reachable from both ``pre_call`` and the success/failure callback.
+    Present in ``model_call_details`` at ``pre_call`` and in both the kwargs and
+    the ``standard_logging_object`` at success/failure, so it's a stable key for
+    the open-call carrier — no back-reference to the logging object required (the
+    object isn't reachable from the callback kwargs at ``pre_call`` time).
     """
-    return kwargs.get("litellm_logging_obj")
+    payload = kwargs.get("standard_logging_object")
+    if isinstance(payload, Mapping):
+        call_id = as_str(payload.get("litellm_call_id")) or as_str(payload.get("id"))
+        if call_id:
+            return call_id
+    return as_str(kwargs.get("litellm_call_id"))
 
 
 def _provisional_llm_span_name(kwargs: Mapping[str, Any]) -> str:
@@ -159,11 +170,31 @@ class OpenTelemetryV2(CustomLogger):
         self._tenant_tracers = TenantTracerCache(
             self.config, callback_name, LITELLM_TRACER_NAME
         )
+        # LLM-call spans opened at the ``pre_call`` boundary, keyed by
+        # ``litellm_call_id`` until the success/failure callback closes them.
+        # Bounded so a call that never closes can't grow it without limit.
+        self._open_llm_calls: "OrderedDict[str, _LLMCallSpan]" = OrderedDict()
         self._init_otel_logger_on_litellm_proxy()
 
     # ====================================================================== #
     #  Proxy global registration
     # ====================================================================== #
+
+    def _register_in_callback_list(self, callbacks: list) -> None:
+        """Append ``self`` to a global litellm callback list, in place and deduped.
+
+        Mutates the list in place rather than via ``getattr(..) or []`` — an empty
+        list is falsy, so the latter would bind a throwaway local and the append
+        would never reach the global. Skips when an OTel-module callback is already
+        registered so a second logger doesn't double up.
+        """
+        already_otel = any(
+            cb.__class__.__module__.startswith(_OTEL_MODULES)
+            for cb in callbacks
+            if hasattr(cb, "__class__")
+        )
+        if not already_otel:
+            callbacks.append(self)
 
     def _init_otel_logger_on_litellm_proxy(self) -> None:
         """Claim ``proxy_server.open_telemetry_logger`` if no one else has."""
@@ -172,18 +203,14 @@ class OpenTelemetryV2(CustomLogger):
         except Exception:
             return
         try:
-            # Mutate ``litellm.service_callback`` in place. ``getattr(..) or []``
-            # would bind a throwaway local when the list is empty (an empty list
-            # is falsy), so the append would never reach the global and service
-            # spans (Redis, Postgres, …) would be silently dropped from traces.
-            service_callback = litellm.service_callback
-            already_otel = any(
-                cb.__class__.__module__.startswith(_OTEL_MODULES)
-                for cb in service_callback
-                if hasattr(cb, "__class__")
-            )
-            if not already_otel:
-                service_callback.append(self)
+            # ``service_callback`` drives the Redis/Postgres service spans.
+            self._register_in_callback_list(litellm.service_callback)
+            # ``input_callback`` is the list ``Logging.pre_call`` iterates to fire
+            # ``log_pre_api_call`` — where the LLM-call span is opened at the call
+            # boundary. Without this the boundary hook never runs and the gen-AI
+            # span is never created. (It's the *sync* input list, matching our
+            # sync ``log_pre_api_call``.)
+            self._register_in_callback_list(litellm.input_callback)
         except Exception:
             pass
         if getattr(proxy_server, "open_telemetry_logger", None) is None:
@@ -209,12 +236,12 @@ class OpenTelemetryV2(CustomLogger):
         callback — whose worker context was copied from the request task and so
         still carries the server span — creates the span then.
         """
-        logging_obj = _logging_object(kwargs)
-        if logging_obj is None:
+        call_id = _call_id(kwargs)
+        if call_id is None:
             return
-        # Idempotent: a retried call may re-enter ``pre_call`` on the same
-        # logging object; keep the first span so its start time is the true one.
-        if getattr(logging_obj, _LLM_SPAN_CARRIER_ATTR, None) is not None:
+        # Idempotent: a retried call may re-enter ``pre_call`` with the same
+        # call id; keep the first span so its start time is the true one.
+        if call_id in self._open_llm_calls:
             return
         start_time_ns = to_ns(datetime.now())
         span: Span | None = None
@@ -228,11 +255,14 @@ class OpenTelemetryV2(CustomLogger):
                     self.tracer, kwargs.get("standard_callback_dynamic_params")
                 ),
             )
-        setattr(
-            logging_obj,
-            _LLM_SPAN_CARRIER_ATTR,
-            _LLMCallSpan(span=span, start_time_ns=start_time_ns),
+        self._open_llm_calls[call_id] = _LLMCallSpan(
+            span=span, start_time_ns=start_time_ns
         )
+        # Evict the oldest open call if the map is over budget. A call that opens
+        # but never closes (a stream that only fires stream events) would linger
+        # otherwise; the evicted span is simply dropped (never exported).
+        if len(self._open_llm_calls) > _OPEN_CALLS_MAX:
+            self._open_llm_calls.popitem(last=False)
 
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
         return None
@@ -254,21 +284,16 @@ class OpenTelemetryV2(CustomLogger):
     ) -> Span | None:
         """Finish the LLM-call span opened at ``pre_call`` (or create it deferred).
 
-        No carrier on the logging object means ``pre_call`` never ran — the
-        request was rejected at the gate or blocked by a pre-call guardrail before
-        any upstream call — so there is nothing to record and no phantom span.
+        No carrier for this call id means ``pre_call`` never ran — the request was
+        rejected at the gate or blocked by a pre-call guardrail before any upstream
+        call — so there is nothing to record and no phantom span.
         """
-        logging_obj = _logging_object(kwargs)
-        carrier: _LLMCallSpan | None = (
-            getattr(logging_obj, _LLM_SPAN_CARRIER_ATTR, None)
-            if logging_obj is not None
-            else None
-        )
+        call_id = _call_id(kwargs)
+        # ``pop`` is the dedup: this method runs from both the success and failure
+        # paths, and whichever fires first removes the carrier and closes the span.
+        carrier = self._open_llm_calls.pop(call_id, None) if call_id else None
         if carrier is None:
             return None
-        # Clear first: this method runs from both the success and failure paths,
-        # and the carrier is the dedup — whichever fires first closes the span.
-        setattr(logging_obj, _LLM_SPAN_CARRIER_ATTR, None)
         payload = kwargs.get("standard_logging_object")
         if not payload:
             if carrier.span is not None:

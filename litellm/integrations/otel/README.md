@@ -96,9 +96,12 @@ becomes the global, so server spans export to that backend too.
    runs synchronously in the request task, just before the upstream call — the
    one point where the FastAPI server span is genuinely the ambient OTel context
    — and **opens** the LLM-call span there, parented to that server span via real
-   ambient context. The open span is stashed on the per-request
-   `LiteLLMLoggingObj` (a typed object), so no live `Span` ever travels through a
-   `litellm_params` metadata dict. The async success/failure callback later
+   ambient context. The open span is held in a bounded cache keyed by
+   `litellm_call_id` (a primitive the callback kwargs carry at both `pre_call` and
+   close), so no live `Span` ever travels through a `litellm_params` metadata
+   dict. For the boundary hook to fire at all, the logger is registered into
+   `litellm.input_callback` — the list `Logging.pre_call` iterates. The async
+   success/failure callback later
    **closes** it: it builds an `LLMCallSpanData` from the typed
    `standard_logging_object` (token usage and cost are computed only by then),
    stamps the attributes, sets status, and ends the span. The sync callback is a
@@ -192,8 +195,10 @@ be imported anywhere:
   translates LiteLLM's logging callbacks into typed span data and hands them to
   the engine. The LLM-call span is opened at the `log_pre_api_call` boundary
   (parented to the live server span via ambient context) and closed at the async
-  success/failure callback; the open span lives on the per-request
-  `LiteLLMLoggingObj`, never in a metadata dict.
+  success/failure callback; the open span is held in a bounded cache keyed by
+  `litellm_call_id`, never threaded through a metadata dict. The logger registers
+  itself into `litellm.input_callback` so `Logging.pre_call` fires the boundary
+  hook.
 
 ### Presets
 

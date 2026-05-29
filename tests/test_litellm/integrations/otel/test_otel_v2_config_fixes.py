@@ -95,10 +95,6 @@ def test_baggage_processor_allowlist_uses_config_keys():
 # --------------------------------------------------------------------------- #
 
 
-class _LoggingObj:
-    """Per-request attribute carrier, like ``LiteLLMLoggingObj``."""
-
-
 def _logger():
     cfg = OpenTelemetryV2Config(exporter="in_memory")
     exporter = InMemorySpanExporter()
@@ -134,7 +130,6 @@ def test_passthrough_llm_span_parents_to_ambient_server_span():
     kwargs = {
         "standard_logging_object": _payload(),
         "litellm_params": {"metadata": {}},
-        "litellm_logging_obj": _LoggingObj(),
     }
     # pre_call runs in the request task (server span ambient); success closes it.
     with trace.use_span(server, end_on_exit=False):
@@ -161,7 +156,6 @@ def test_llm_span_unaffected_by_phase_span_active_at_close():
     kwargs = {
         "standard_logging_object": _payload(),
         "litellm_params": {"metadata": {}},
-        "litellm_logging_obj": _LoggingObj(),
     }
     with trace.use_span(server, end_on_exit=False):
         logger.log_pre_api_call(model="gpt-4o", messages=[], kwargs=kwargs)

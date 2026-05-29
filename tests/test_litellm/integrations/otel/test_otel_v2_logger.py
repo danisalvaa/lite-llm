@@ -70,21 +70,12 @@ def _payload(**overrides):
     return payload
 
 
-class _LoggingObj:
-    """Minimal stand-in for ``LiteLLMLoggingObj``: a plain per-request attribute
-    carrier. The logger stashes the open boundary span on it, exactly as it does
-    on the real logging object threaded through ``model_call_details``."""
-
-
-def _kwargs(payload=None, logging_obj=None):
+def _kwargs(payload=None):
     return {
+        # ``litellm_call_id`` (here carried inside the payload) correlates the
+        # pre_call boundary with the close callback — the carrier is keyed by it.
         "standard_logging_object": payload if payload is not None else _payload(),
         "litellm_params": {"metadata": {}},
-        # The same logging object is reachable from pre_call and the success
-        # callback in real litellm; tests reuse one instance across both.
-        "litellm_logging_obj": (
-            logging_obj if logging_obj is not None else _LoggingObj()
-        ),
     }
 
 
@@ -227,8 +218,8 @@ def test_idempotent_on_repeat_callback():
 
 
 def test_pre_call_idempotent_keeps_first_span():
-    """A retried call may re-enter ``pre_call`` on the same logging object; the
-    first span (with the true start time) is kept, not replaced."""
+    """A retried call may re-enter ``pre_call`` with the same call id; the first
+    span (with the true start time) is kept, not replaced."""
     logger, _ = _logger()
     kwargs = _kwargs()
     server = logger._emitter.start_span(
@@ -236,11 +227,9 @@ def test_pre_call_idempotent_keeps_first_span():
     )
     with trace.use_span(server, end_on_exit=False):
         logger.log_pre_api_call(model="gpt-4o", messages=[], kwargs=kwargs)
-        from litellm.integrations.otel.logger import _LLM_SPAN_CARRIER_ATTR
-
-        first = getattr(kwargs["litellm_logging_obj"], _LLM_SPAN_CARRIER_ATTR)
+        first = logger._open_llm_calls["call_1"]
         logger.log_pre_api_call(model="gpt-4o", messages=[], kwargs=kwargs)
-        second = getattr(kwargs["litellm_logging_obj"], _LLM_SPAN_CARRIER_ATTR)
+        second = logger._open_llm_calls["call_1"]
     server.end()
     assert first is second  # not overwritten
 
@@ -272,6 +261,53 @@ def test_llm_span_is_root_without_ambient_server_span():
     _emit_llm(logger)
     (span,) = exporter.get_finished_spans()
     assert span.parent is None  # standalone (no proxy server span) → root
+
+
+def test_real_logging_pre_call_opens_span_end_to_end():
+    """Regression guard: a real ``LiteLLMLoggingObj.pre_call`` must fire
+    ``log_pre_api_call`` on the V2 logger (via ``litellm.input_callback``), so the
+    boundary span is opened and then closed by the success callback. If the logger
+    is not wired into ``input_callback``, no span is produced at all."""
+    import litellm
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    logger, exporter = _logger()
+    # Register exactly this logger as the (only) input callback pre_call iterates.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(litellm, "input_callback", [logger], raising=False)
+    try:
+        logging_obj = Logging(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            call_type="acompletion",
+            start_time=datetime.now(),
+            litellm_call_id="call_e2e",
+            function_id="fn",
+        )
+        # The wrapper always runs this before pre_call — it's what seeds
+        # ``litellm_params`` and ``litellm_call_id`` into ``model_call_details``
+        # (the call id is how the close callback correlates back to this span).
+        logging_obj.update_environment_variables(
+            litellm_params={"metadata": {}},
+            optional_params={},
+            model="gpt-4o",
+        )
+        # pre_call fires log_pre_api_call → opens the boundary span on the obj.
+        logging_obj.pre_call(input="hi", api_key="sk-test")
+        # The success callback closes it, reading the typed payload.
+        logging_obj.model_call_details["standard_logging_object"] = _payload(
+            litellm_call_id="call_e2e"
+        )
+        asyncio.run(
+            logger.async_log_success_event(
+                logging_obj.model_call_details, None, None, None
+            )
+        )
+    finally:
+        monkeypatch.undo()
+    (span,) = exporter.get_finished_spans()
+    assert span.name == "chat gpt-4o"
 
 
 def test_deferred_span_parents_to_ambient_at_close():
@@ -705,6 +741,31 @@ def test_registers_into_litellm_service_callback(monkeypatch):
     otel_registrations = [
         cb
         for cb in litellm.service_callback
+        if cb.__class__.__module__.startswith("litellm.integrations.otel")
+    ]
+    assert len(otel_registrations) == 1
+
+
+def test_registers_into_litellm_input_callback(monkeypatch):
+    """The logger must land in ``litellm.input_callback`` — the list
+    ``Logging.pre_call`` iterates to fire ``log_pre_api_call``. Without this the
+    boundary hook never runs and the gen-AI span is never opened (the span goes
+    completely missing). Deduped like ``service_callback``.
+    """
+    import litellm
+
+    pytest.importorskip("litellm.proxy.proxy_server")
+    monkeypatch.setattr(litellm, "input_callback", [], raising=False)
+    cfg = OpenTelemetryV2Config(exporter="in_memory")
+    tp = providers.build_tracer_provider(cfg)
+
+    first = OpenTelemetryV2(config=cfg, tracer_provider=tp)
+    assert first in litellm.input_callback
+
+    OpenTelemetryV2(config=cfg, tracer_provider=tp)
+    otel_registrations = [
+        cb
+        for cb in litellm.input_callback
         if cb.__class__.__module__.startswith("litellm.integrations.otel")
     ]
     assert len(otel_registrations) == 1
