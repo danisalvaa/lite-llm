@@ -4,7 +4,7 @@ Interactive Claude Code `/plugin marketplace add http://127.0.0.1:4000/claude-co
 
 Before: `e73f949fbb735b344f75e5f8c395344bf4cfdb54`, marketplace added without credentials
 
-After: `97fcc19a32b47def0d1ba6de28e70915adabd00e`, anonymous access rejected with HTTP 401
+After: `cf3621d9b3a7d300b2f0dd866fccf1b889e39c5a`, anonymous access rejected with HTTP 401
 
 Captured on 2026-09-23 using Claude Code 2.1.269. These are captures of the actual interactive terminal window. No model inference was needed for catalog discovery
 
